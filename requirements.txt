@@ -1,0 +1,16 @@
+# Python 3.12; validated on one RTX 4090 with CUDA 12.8.
+torch==2.9.1
+transformers==4.57.3
+peft==0.18.0
+accelerate==1.12.0
+bitsandbytes==0.49.1
+datasets==4.4.2
+huggingface-hub>=0.34,<2
+safetensors==0.7.0
+tokenizers==0.22.1
+numpy==2.2.6
+pandas==2.3.3
+tqdm==4.62.3
+einops==0.8.1
+scipy==1.15.3
+sentencepiece>=0.2,<1

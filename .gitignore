@@ -1,0 +1,31 @@
+# Ignored runtime artifacts
+data/
+checkpoints/
+models/
+outputs/
+logs/
+# Local IDE settings
+.cursor/
+.idea/
+.vscode/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+.venvs/
+env/
+
+# Local credentials and runtime state
+.env
+.env.*
+!.env.example
+*.pid
+wandb/
+
+# Jupyter
+.ipynb_checkpoints/
