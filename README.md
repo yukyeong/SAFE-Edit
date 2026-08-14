@@ -1,4 +1,4 @@
-# D-PIKE: LLM Privacy Memorization, FFN Edit, and Attention Heads Edit
+# SAFE-Edit: LLM Privacy Memorization, FFN Edit, and Attention Heads Edit
 
 This repository provides single-GPU (RTX 4090) reproducible code for privacy memorization experiments covering:
 
@@ -28,14 +28,15 @@ Joint pipeline order:
 ## 2. Layout
 
 ```text
-configs/ffn_edit/                 Training and FFN Edit / joint experiment entrypoints
-configs/attention_heads_edit/     Attention Heads Edit sweeps and static head configs
-scripts/ffn_edit/                 Data preparation and unified reproduction entrypoints
-srcs/ffn_edit/train/              Three-model QLoRA fine-tuning
-srcs/ffn_edit/eval/               FFN Edit neuron attribution
-srcs/ffn_edit/utils/              Llama3 / Qwen3 / Ministral3 hooks
-srcs/attention_heads_edit/        Attention Heads Edit localization, screening, and metrics
-outputs/                          Runtime metrics (not versioned)
+configs/heads/                    Static API4 Attention Heads Edit JSON configs
+scripts/_common.sh                Shared REPO_ROOT + PYTHONPATH=src
+scripts/prepare/                  Dataset preparation CLIs
+scripts/train/                    QLoRA / SFT entrypoints
+scripts/eval/                     Baseline, sweep, and joint evaluation entrypoints
+scripts/pipelines/                Multi-model end-to-end pipelines
+src/ffn_edit/                     FFN Edit hooks, locate, and training code
+src/attention_heads_edit/         Attention Heads Edit core, locate, and eval
+outputs/                          Runtime metrics, manifests, generated heads (not versioned)
 logs/                             Runtime logs (not versioned)
 ```
 
@@ -51,11 +52,14 @@ python3.12 -m venv .venvs/repro
 source .venvs/repro/bin/activate
 pip install -U pip
 pip install -r requirements.txt
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 
 python3.12 -m venv .venvs/ministral3
 .venvs/ministral3/bin/pip install -U pip
 .venvs/ministral3/bin/pip install -r requirements-ministral.txt
 ```
+
+Bash entrypoints under `scripts/` source `scripts/_common.sh`, which sets `REPO_ROOT` and `PYTHONPATH=src`. For direct `python -m ...` calls, export `PYTHONPATH` as above.
 
 Use `requirements.txt` for Llama3 and Qwen3. Ministral needs a separate venv (`requirements-ministral.txt`) because its `mistral3` wrapper requires Transformers 5.0.0rc0, which conflicts with the 4.57.3 pin above.
 
@@ -100,10 +104,10 @@ data/api4_200k/sft_true_prefix_no_instruction_all.json
 ```
 
 ```bash
-python scripts/ffn_edit/prepare_api4_privacy_bags.py \
+python scripts/prepare/prepare_api4_privacy_bags.py \
   --dataset data/api4_200k/sft_true_prefix_no_instruction_all.json \
   --output data/api4_200k/privacy_data_api4_all.json
-python srcs/attention_heads_edit/scripts/validate_api4_edit_dataset.py \
+python -m attention_heads_edit.eval.validate_api4_edit_dataset \
   --dataset data/api4_200k/sft_true_prefix_no_instruction_all.json \
   --privacy_data data/api4_200k/privacy_data_api4_all.json \
   --require_privacy_alignment
@@ -114,10 +118,10 @@ python srcs/attention_heads_edit/scripts/validate_api4_edit_dataset.py \
 ```bash
 git clone --depth 1 https://github.com/amazon-science/lume-llm-unlearning.git \
   data/lume/lume-llm-unlearning
-python scripts/ffn_edit/prepare_lume_api4_prefix.py
-python scripts/ffn_edit/prepare_lume_hard_balanced.py
-python scripts/ffn_edit/prepare_lume_edit_subsets.py
-python srcs/attention_heads_edit/scripts/validate_api4_edit_dataset.py \
+python scripts/prepare/prepare_lume_api4_prefix.py
+python scripts/prepare/prepare_lume_hard_balanced.py
+python scripts/prepare/prepare_lume_edit_subsets.py
+python -m attention_heads_edit.eval.validate_api4_edit_dataset \
   --dataset data/lume/api4_prefix_task2/sft_true_prefix_no_instruction_scenario_clean_all.json \
   --privacy_data data/lume/api4_prefix_task2/privacy_data_lume_task2_scenario_clean_all.json \
   --expected_pii_types ADDRESS,DOB,EMAIL,PHONENUMBER,SSN \
@@ -132,8 +136,8 @@ python srcs/attention_heads_edit/scripts/validate_api4_edit_dataset.py \
 hf download metaboulie/Tidied-PII-Detection-Kaggle-7k \
   --repo-type dataset \
   --local-dir data/crapii/tidied-pii-detection-kaggle-7k
-python scripts/ffn_edit/prepare_crapii_api4_prefix.py
-python srcs/attention_heads_edit/scripts/validate_api4_edit_dataset.py \
+python scripts/prepare/prepare_crapii_api4_prefix.py
+python -m attention_heads_edit.eval.validate_api4_edit_dataset \
   --dataset data/crapii/api4_prefix/sft_true_prefix_no_instruction_all.json \
   --privacy_data data/crapii/api4_prefix/privacy_data_crapii_all.json \
   --require_privacy_alignment
@@ -142,7 +146,7 @@ python srcs/attention_heads_edit/scripts/validate_api4_edit_dataset.py \
 CRAPII splits by document into train/val/heldout. For no-copy diagnostics:
 
 ```bash
-python scripts/ffn_edit/prepare_crapii_api4_prefix.py \
+python scripts/prepare/prepare_crapii_api4_prefix.py \
   --output_dir data/crapii/api4_prefix_no_copy \
   --drop_target_in_prefix
 ```
@@ -150,7 +154,7 @@ python scripts/ffn_edit/prepare_crapii_api4_prefix.py \
 ### 5.5 PPL Data
 
 ```bash
-python scripts/ffn_edit/prepare_wikitext_utility.py
+python scripts/prepare/prepare_wikitext_utility.py
 ```
 
 Writes `data/external/wikitext-103-raw-v1/validation.jsonl`. Missing PPL data makes the full PPL stage fail instead of silently emitting incomplete metrics.
@@ -160,7 +164,7 @@ Writes `data/external/wikitext-103-raw-v1/validation.jsonl`. Missing PPL data ma
 ### 6.1 Llama3-8B / API4-200K
 
 ```bash
-bash scripts/ffn_edit/run_llama3_api4_prefix_qlora_full.sh
+bash scripts/train/api4_llama_qlora.sh
 tail -f logs/ffn_edit/train/run_llama3_api4_prefix_qlora_full_*.log
 ```
 
@@ -169,10 +173,10 @@ This launches background training and syncs the final adapter to `models/llama3-
 ### 6.2 Three Models / LUME
 
 ```bash
-bash configs/ffn_edit/runs/run_lume_task2_llama3_prefix_qlora.sh
-bash configs/ffn_edit/runs/run_lume_task2_qwen3_8b_hard_balanced_qlora.sh
+bash scripts/train/lume_llama_qlora.sh
+bash scripts/train/lume_qwen_qlora.sh
 MINISTRAL_PYTHON="$PWD/.venvs/ministral3/bin/python" \
-  bash configs/ffn_edit/runs/run_lume_task2_ministral3_8b_base_hard_balanced_qlora.sh
+  bash scripts/train/lume_ministral_qlora.sh
 ```
 
 Final adapters:
@@ -189,7 +193,7 @@ models/ministral-3-8b-base/lume_task2_hard_balanced_qlora
 for model in llama qwen ministral; do
   CRAPII_MODEL_KIND="$model" \
   CRAPII_PYTHON="$([ "$model" = ministral ] && echo "$PWD/.venvs/ministral3/bin/python" || command -v python)" \
-    bash configs/ffn_edit/runs/run_crapii_prefix_sft_model.sh
+    bash scripts/train/crapii_sft_model.sh
 done
 ```
 
@@ -200,7 +204,7 @@ These configs use 4-bit QLoRA for 24GB GPUs. Ministral LoRA targets use nested `
 Evaluate the fine-tuned baseline first:
 
 ```bash
-bash configs/attention_heads_edit/runs/run_api4_baseline_metrics_repro.sh
+bash scripts/eval/api4_baseline_metrics.sh
 ```
 
 ### 7.1 FFN Edit Count Sweep
@@ -208,7 +212,7 @@ bash configs/attention_heads_edit/runs/run_api4_baseline_metrics_repro.sh
 ```bash
 RUN_NAME=api4_ffn_edit_repro \
 ERASE_LIST="64 128 256 512 1024" \
-  bash configs/ffn_edit/runs/run_api4_ffn_edit_only_recheck_64_1024.sh
+  bash scripts/eval/api4_ffn_only_sweep.sh
 
 export FFN_EDIT_KN_CONFIG="outputs/ffn_edit/ffn_edit_only_recheck_64_1024/api4_ffn_edit_repro/attribution/kn/kn_bag-api4_ffn_edit_repro.json"
 ```
@@ -218,15 +222,15 @@ Outputs include KN rankings, per-erase full metrics, and `outputs/ffn_edit/metri
 ### 7.2 Attention Heads Edit: Fixed Alpha, Vary Top-k
 
 ```bash
-bash configs/attention_heads_edit/runs/run_api4_attention_heads_edit_top100_a015_fixed_topN_small.sh  # top 10/15/20
-bash configs/attention_heads_edit/runs/run_api4_attention_heads_edit_top100_a015_fixed_topN_large.sh  # top 30/35/40/45
+bash scripts/eval/api4_heads_topk_small.sh  # top 10/15/20
+bash scripts/eval/api4_heads_topk_large.sh  # top 30/35/40/45
 ```
 
 ### 7.3 Attention Heads Edit: Fixed Top40, Vary Alpha
 
 ```bash
 ALPHAS="0.01 0.05 0.1 0.15 0.2 0.3 0.5" \
-  bash configs/attention_heads_edit/runs/run_api4_attention_heads_edit_top40_alpha_sweep.sh
+  bash scripts/eval/api4_heads_alpha_sweep.sh
 ```
 
 ### 7.4 Joint: Fixed Attention Heads Edit, Vary FFN Edit Count
@@ -235,7 +239,7 @@ ALPHAS="0.01 0.05 0.1 0.15 0.2 0.3 0.5" \
 FFN_EDIT_KN_CONFIG="$FFN_EDIT_KN_CONFIG" \
 FFN_EDIT_RECHECK_SUMMARY=outputs/ffn_edit/metrics/api4_ffn_edit_repro/paper_main_table.csv \
 ERASE_LIST="64 128 256 512 1024" \
-  bash configs/ffn_edit/runs/run_api4_ffn_edit_then_attention_heads_edit_top30_a001_erase_sweep.sh
+  bash scripts/eval/api4_joint_erase_sweep.sh
 ```
 
 ### 7.5 Joint: Fixed FFN Edit256/top30, Vary Attention Heads Edit Alpha
@@ -243,10 +247,10 @@ ERASE_LIST="64 128 256 512 1024" \
 ```bash
 FFN_EDIT_KN_CONFIG="$FFN_EDIT_KN_CONFIG" \
 ALPHAS="0.01 0.05 0.1 0.15 0.2 0.3 0.5" \
-  bash configs/ffn_edit/runs/run_api4_ffn_edit256_then_attention_heads_edit_top30_alpha_sweep.sh
+  bash scripts/eval/api4_joint_alpha_sweep.sh
 ```
 
-Static top-k head JSON files under `configs/attention_heads_edit/runs/api4_attention_heads_edit_top100_a015_fixed_topN_*.json` are Llama3 API4 only. Qwen3 and Ministral3 must relocate heads locally.
+Static top-k head JSON files under `configs/heads/api4_top100_a015_top*.json` are Llama3 API4 only. Qwen3 and Ministral3 must relocate heads locally.
 
 ## 8. LUME/CRAPII Three-Model Experiments
 
@@ -255,7 +259,7 @@ Unified entrypoint from scratch: FFN Edit localization -> FFN Edit-only full met
 ```bash
 for dataset in lume crapii; do
   for model in llama qwen ministral; do
-    bash scripts/ffn_edit/run_three_model_privacy_pipeline.sh "$dataset" "$model"
+    bash scripts/pipelines/three_model_privacy.sh "$dataset" "$model"
   done
 done
 ```
@@ -275,7 +279,7 @@ Override with environment variables, for example:
 
 ```bash
 FFN_EDIT_ERASE_NUM=16 SELECT_TOP_K=10 ATTENTION_HEADS_EDIT_ALPHA=0.02 \
-  bash scripts/ffn_edit/run_three_model_privacy_pipeline.sh lume qwen
+  bash scripts/pipelines/three_model_privacy.sh lume qwen
 ```
 
 ## 9. Metrics and Outputs
@@ -290,8 +294,8 @@ Primary outputs:
 ```text
 outputs/ffn_edit/metrics/<run>/paper_main_table.csv
 outputs/attention_heads_edit/metrics/<run>/paper_main_table.csv
-configs/ffn_edit/runs/<run>_manifest.json
-configs/attention_heads_edit/runs/<run>_*.json
+outputs/logs/manifests/<run>_manifest.json
+outputs/attention_heads_edit/heads/<run>_*.json
 logs/ffn_edit/<run>.log
 ```
 
@@ -307,10 +311,11 @@ Lower privacy metrics usually mean less leakage; lower PPL usually means better 
 ## 11. Smoke Checks
 
 ```bash
-python -m compileall -q scripts/ffn_edit srcs/ffn_edit srcs/attention_heads_edit/scripts srcs/attention_heads_edit/attention_heads_edit_lib
-bash -n scripts/ffn_edit/*.sh configs/ffn_edit/runs/*.sh configs/attention_heads_edit/runs/*.sh
-python scripts/ffn_edit/prepare_api4_privacy_bags.py --help
-python srcs/attention_heads_edit/scripts/validate_api4_edit_dataset.py --help
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+python -m compileall -q src scripts/prepare
+bash -n scripts/train/*.sh scripts/eval/*.sh scripts/pipelines/*.sh scripts/_common.sh
+python scripts/prepare/prepare_api4_privacy_bags.py --help
+python -m attention_heads_edit.eval.validate_api4_edit_dataset --help
 ```
 
 If a process is waiting for GPU memory, logs periodically report usage. Missing data, adapters, WikiText, or KN/head configs cause hard failures instead of incomplete “success” metrics.
