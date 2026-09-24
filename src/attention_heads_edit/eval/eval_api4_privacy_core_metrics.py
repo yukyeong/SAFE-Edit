@@ -44,7 +44,12 @@ from attention_heads_edit.eval.eval_api4_privacy_reverse_attention_heads_edit im
     unwrap_model_for_attention_heads_edit,
 )
 from attention_heads_edit.attention_heads_edit import AttentionHeadsEdit
-from attention_heads_edit.locate.attention_heads_privacy_spans import STEERING_SPAN_MODES, select_privacy_steering_span
+from attention_heads_edit.eval.ppl_filehash import file_sha256
+from attention_heads_edit.locate.attention_heads_privacy_spans import (
+    STEERING_SPAN_MODES,
+    select_privacy_steering_span,
+    select_privacy_steering_token_range,
+)
 
 
 REPO_ROOT = repo_root()
@@ -104,7 +109,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ppl_max_blocks", type=int, default=128)
     parser.add_argument("--ppl_block_tokens", type=int, default=512)
     parser.add_argument("--ppl_batch_size", type=int, default=1)
-    parser.add_argument("--ppl_attention_heads_edit_mode", default="none", choices=["none", "full_block"])
+    parser.add_argument(
+        "--ppl_attention_heads_edit_mode",
+        default="none",
+        choices=["none", "full_block", "aligned_span"],
+        help="none: no Attention Heads Edit on WikiText; full_block: suppress the entire block; "
+        "aligned_span: apply the same prefix-tail span as leakage eval.",
+    )
+    parser.add_argument(
+        "--ppl_score_region",
+        default="continuation",
+        choices=["full_block", "continuation"],
+        help="full_block: score every token in the WikiText block; "
+        "continuation: score only the teacher-forced continuation after a fixed prefix.",
+    )
+    parser.add_argument("--ppl_prefix_tokens", type=int, default=384)
+    parser.add_argument("--ppl_continuation_tokens", type=int, default=128)
+    parser.add_argument(
+        "--ppl_protocol",
+        default="prefix_continuation_v1",
+        help="Protocol id stored in ppl.json.",
+    )
     parser.add_argument("--save_text_predictions", action="store_true")
     parser.add_argument("--log_every", type=int, default=50)
     return parser.parse_args()
@@ -212,6 +237,7 @@ def steering_context(
     substrings: list[str],
     model_inputs,
     offsets_mapping,
+    token_ranges=None,
 ):
     if attention_heads_edit_steerer is None:
         return nullcontext()
@@ -222,6 +248,7 @@ def steering_context(
         model_input=model_inputs,
         offsets_mapping=offsets_mapping,
         occurrence=-1,
+        token_ranges=token_ranges,
     )
 
 
@@ -454,7 +481,7 @@ def evaluate_attack(model, attention_heads_edit_model, tokenizer, attention_head
     }
 
 
-def load_wikitext_blocks(tokenizer, path: Path, block_tokens: int, max_blocks: int) -> list[str]:
+def load_wikitext_token_blocks(tokenizer, path: Path, block_tokens: int, max_blocks: int) -> list[list[int]]:
     token_buffer: list[int] = []
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
@@ -465,28 +492,123 @@ def load_wikitext_blocks(tokenizer, path: Path, block_tokens: int, max_blocks: i
             token_buffer.extend(tokenizer(text + "\n", add_special_tokens=False)["input_ids"])
             if max_blocks > 0 and len(token_buffer) >= block_tokens * max_blocks:
                 break
-    blocks = []
+    blocks: list[list[int]] = []
     usable = len(token_buffer) // block_tokens * block_tokens
     for start in range(0, usable, block_tokens):
         if max_blocks > 0 and len(blocks) >= max_blocks:
             break
-        blocks.append(tokenizer.decode(token_buffer[start : start + block_tokens], skip_special_tokens=True))
+        blocks.append(list(token_buffer[start : start + block_tokens]))
     return blocks
 
 
-@torch.no_grad()
-def evaluate_ppl(model, attention_heads_edit_model, tokenizer, attention_heads_edit_steerer: AttentionHeadsEdit | None, args):
-    device = model_device(model)
+def load_wikitext_blocks(tokenizer, path: Path, block_tokens: int, max_blocks: int) -> list[str]:
+    return [
+        tokenizer.decode(block, skip_special_tokens=True)
+        for block in load_wikitext_token_blocks(tokenizer, path, block_tokens, max_blocks)
+    ]
+
+
+def tokenizer_special_affixes(tokenizer) -> tuple[list[int], list[int]]:
+    no_special = list(tokenizer.encode("X", add_special_tokens=False))
+    with_special = list(tokenizer.encode("X", add_special_tokens=True))
+    if not no_special:
+        return [], []
+    width = len(no_special)
+    for start in range(0, len(with_special) - width + 1):
+        if with_special[start : start + width] == no_special:
+            return with_special[:start], with_special[start + width :]
+    builder = getattr(tokenizer, "build_inputs_with_special_tokens", None)
+    if callable(builder):
+        probe_id = no_special[0]
+        try:
+            built = list(builder([probe_id]))
+            idx = built.index(probe_id)
+            return built[:idx], built[idx + 1 :]
+        except (AttributeError, ValueError, TypeError):
+            pass
+    prefix: list[int] = []
+    suffix: list[int] = []
+    bos = getattr(tokenizer, "bos_token_id", None)
+    eos = getattr(tokenizer, "eos_token_id", None)
+    if getattr(tokenizer, "add_bos_token", False) and bos is not None:
+        prefix = [int(bos)]
+    if getattr(tokenizer, "add_eos_token", False) and eos is not None:
+        suffix = [int(eos)]
+    return prefix, suffix
+
+
+def ppl_fingerprint(args) -> dict[str, Any]:
+    kn_path = Path(args.ffn_edit_kn_config) if getattr(args, "ffn_edit_kn_config", None) else None
+    return {
+        "ppl_protocol": args.ppl_protocol,
+        "ppl_score_region": args.ppl_score_region,
+        "ppl_attention_heads_edit_mode": args.ppl_attention_heads_edit_mode,
+        "ppl_prefix_tokens": args.ppl_prefix_tokens,
+        "ppl_continuation_tokens": args.ppl_continuation_tokens,
+        "ppl_block_tokens": args.ppl_block_tokens,
+        "ppl_max_blocks": args.ppl_max_blocks,
+        "ppl_batch_size": args.ppl_batch_size,
+        "utility_dataset": str(args.utility_dataset),
+        "base_model": str(args.base_model),
+        "adapter": str(args.adapter),
+        "ffn_edit_kn_config": str(kn_path) if kn_path else None,
+        "ffn_edit_kn_sha256": file_sha256(kn_path),
+        "ffn_edit_erase_num": args.ffn_edit_erase_num,
+        "disable_attention_heads_edit": bool(args.disable_attention_heads_edit),
+        "head_config": str(args.head_config) if args.head_config else None,
+        "alpha": args.alpha,
+        "scale_position": args.scale_position,
+        "steering_span_mode": args.steering_span_mode,
+        "steering_tail_tokens": args.steering_tail_tokens,
+        "load_in_4bit": bool(args.load_in_4bit),
+        "attn_implementation": args.attn_implementation,
+        "span_alignment": "explicit_token_range",
+    }
+
+
+def ppl_steering_substrings(batch: list[str], tokenizer, args) -> list[str]:
+    if args.ppl_attention_heads_edit_mode == "full_block":
+        return list(batch)
+    if args.ppl_attention_heads_edit_mode != "aligned_span":
+        return list(batch)
+    return [
+        select_privacy_steering_span(
+            text,
+            tokenizer,
+            mode=args.steering_span_mode,
+            tail_tokens=args.steering_tail_tokens,
+        )
+        for text in batch
+    ]
+
+
+def evaluate_ppl_full_block(model, attention_heads_edit_model, tokenizer, attention_heads_edit_steerer: AttentionHeadsEdit | None, args, device):
     blocks = load_wikitext_blocks(tokenizer, args.utility_dataset, args.ppl_block_tokens, args.ppl_max_blocks)
     losses: list[float] = []
     token_counts: list[int] = []
+    selected_span_token_counts: list[int] = []
+    apply_heads = attention_heads_edit_steerer is not None and args.ppl_attention_heads_edit_mode in {"full_block", "aligned_span"}
     for start in tqdm(range(0, len(blocks), args.ppl_batch_size), desc=f"ppl-{args.method_name}"):
         batch = blocks[start : start + args.ppl_batch_size]
         model_inputs, offsets_mapping = prepare_steering_inputs(attention_heads_edit_steerer, tokenizer, batch, device)
         labels = model_inputs["input_ids"].clone()
         labels[model_inputs["attention_mask"] == 0] = -100
-        ppl_steerer = attention_heads_edit_steerer if args.ppl_attention_heads_edit_mode == "full_block" else None
-        with steering_context(ppl_steerer, attention_heads_edit_model, batch, batch, model_inputs, offsets_mapping):
+        ppl_steerer = attention_heads_edit_steerer if apply_heads else None
+        substrings = ppl_steering_substrings(batch, tokenizer, args) if apply_heads else batch
+        if apply_heads and args.ppl_attention_heads_edit_mode == "aligned_span":
+            for text, span, offset_row in zip(batch, substrings, offsets_mapping):
+                start_char = text.rfind(span)
+                if start_char < 0:
+                    raise RuntimeError("aligned_span substring was not found in the WikiText block")
+                end_char = start_char + len(span)
+                n_span_tokens = 0
+                for start_off, end_off in offset_row.tolist():
+                    if int(end_off) <= int(start_off):
+                        continue
+                    if int(start_off) >= start_char and int(end_off) <= end_char:
+                        n_span_tokens += 1
+                selected_span_token_counts.append(n_span_tokens)
+        with steering_context(ppl_steerer, attention_heads_edit_model, batch, substrings, model_inputs, offsets_mapping):
             outputs = model(**model_inputs, labels=labels, use_cache=False, return_dict=True, **ffn_edit_forward_kwargs(args))
         valid_tokens = int((labels[:, 1:] != -100).sum().item())
         if valid_tokens <= 0:
@@ -496,6 +618,11 @@ def evaluate_ppl(model, attention_heads_edit_model, tokenizer, attention_heads_e
     total_tokens = sum(token_counts)
     mean_loss = sum(losses) / total_tokens if total_tokens else None
     ppl = math.exp(mean_loss) if mean_loss is not None and math.isfinite(mean_loss) else None
+    span_token_mean = (
+        sum(selected_span_token_counts) / len(selected_span_token_counts)
+        if selected_span_token_counts
+        else None
+    )
     return {
         "method": args.method_name,
         "utility_dataset": str(args.utility_dataset),
@@ -504,8 +631,128 @@ def evaluate_ppl(model, attention_heads_edit_model, tokenizer, attention_heads_e
         "retain_loss": mean_loss,
         "retain_ppl": ppl,
         "attention_heads_edit_applied_to_full_wikitext_block": attention_heads_edit_steerer is not None and args.ppl_attention_heads_edit_mode == "full_block",
+        "attention_heads_edit_applied_to_aligned_span": attention_heads_edit_steerer is not None and args.ppl_attention_heads_edit_mode == "aligned_span",
         "ppl_attention_heads_edit_mode": args.ppl_attention_heads_edit_mode,
+        "ppl_score_region": "full_block",
+        "steering_span_mode": args.steering_span_mode if args.ppl_attention_heads_edit_mode == "aligned_span" else None,
+        "steering_tail_tokens": args.steering_tail_tokens if args.ppl_attention_heads_edit_mode == "aligned_span" else None,
+        "selected_span_token_count_mean": span_token_mean,
+        "selected_span_block_count": len(selected_span_token_counts),
+        "fingerprint": ppl_fingerprint(args),
     }
+
+
+@torch.no_grad()
+def evaluate_ppl_continuation(model, attention_heads_edit_model, tokenizer, attention_heads_edit_steerer: AttentionHeadsEdit | None, args, device):
+    if args.ppl_batch_size != 1:
+        raise SystemExit("prefix-continuation PPL requires --ppl_batch_size 1")
+    if args.ppl_prefix_tokens <= 0 or args.ppl_continuation_tokens <= 0:
+        raise SystemExit("ppl_prefix_tokens and ppl_continuation_tokens must be positive")
+    needed = args.ppl_prefix_tokens + args.ppl_continuation_tokens
+    if needed > args.ppl_block_tokens:
+        raise SystemExit("ppl_prefix_tokens + ppl_continuation_tokens cannot exceed ppl_block_tokens")
+    if args.ppl_attention_heads_edit_mode == "full_block":
+        raise SystemExit("prefix-continuation PPL forbids ppl_attention_heads_edit_mode=full_block")
+
+    blocks = load_wikitext_token_blocks(tokenizer, args.utility_dataset, args.ppl_block_tokens, args.ppl_max_blocks)
+    prefix_specials, suffix_specials = tokenizer_special_affixes(tokenizer)
+    losses: list[float] = []
+    token_counts: list[int] = []
+    selected_span_token_counts: list[int] = []
+    scored_see_span: list[int] = []
+    apply_heads = attention_heads_edit_steerer is not None and args.ppl_attention_heads_edit_mode == "aligned_span"
+
+    for block in tqdm(blocks, desc=f"ppl-{args.method_name}"):
+        prefix_ids = list(block[: args.ppl_prefix_tokens])
+        cont_ids = list(block[args.ppl_prefix_tokens : args.ppl_prefix_tokens + args.ppl_continuation_tokens])
+        if len(prefix_ids) != args.ppl_prefix_tokens or len(cont_ids) != args.ppl_continuation_tokens:
+            raise RuntimeError("WikiText block does not contain the requested prefix/continuation split")
+        rel_start, rel_end = select_privacy_steering_token_range(
+            len(prefix_ids),
+            mode=args.steering_span_mode,
+            tail_tokens=args.steering_tail_tokens,
+        )
+        input_ids = prefix_specials + prefix_ids + cont_ids + suffix_specials
+        prefix_len = len(prefix_specials) + len(prefix_ids)
+        cont_end = prefix_len + len(cont_ids)
+        span_start = len(prefix_specials) + rel_start
+        span_end = len(prefix_specials) + rel_end
+        if not (0 <= span_start < span_end <= prefix_len):
+            raise RuntimeError(f"invalid explicit span [{span_start}, {span_end}) for prefix_len={prefix_len}")
+
+        model_inputs = {
+            "input_ids": torch.tensor([input_ids], device=device, dtype=torch.long),
+            "attention_mask": torch.ones(1, len(input_ids), device=device, dtype=torch.long),
+        }
+        labels = model_inputs["input_ids"].clone()
+        labels[:, :prefix_len] = -100
+        labels[:, cont_end:] = -100
+        valid_tokens = int((labels[:, 1:] != -100).sum().item())
+        if valid_tokens != len(cont_ids):
+            raise RuntimeError(f"expected {len(cont_ids)} continuation labels, got {valid_tokens}")
+
+        dummy_text = tokenizer.decode(input_ids, skip_special_tokens=False)
+        token_ranges = None
+        ppl_steerer = attention_heads_edit_steerer if apply_heads else None
+        if apply_heads:
+            token_ranges = [torch.tensor([[span_start, span_end]], device=device, dtype=torch.long)]
+        with steering_context(
+            ppl_steerer,
+            attention_heads_edit_model,
+            [dummy_text],
+            [dummy_text[0:1] if dummy_text else ""],
+            model_inputs,
+            None,
+            token_ranges=token_ranges,
+        ):
+            outputs = model(**model_inputs, labels=labels, use_cache=False, return_dict=True, **ffn_edit_forward_kwargs(args))
+        losses.append(float(outputs.loss.item()) * valid_tokens)
+        token_counts.append(valid_tokens)
+        selected_span_token_counts.append(span_end - span_start)
+        first_query = prefix_len - 1
+        scored_see_span.append(int(first_query >= span_end - 1))
+
+    total_tokens = sum(token_counts)
+    mean_loss = sum(losses) / total_tokens if total_tokens else None
+    ppl = math.exp(mean_loss) if mean_loss is not None and math.isfinite(mean_loss) else None
+    if scored_see_span and sum(scored_see_span) != len(scored_see_span):
+        raise RuntimeError("some continuation query positions cannot attend to the prefix-tail span")
+    return {
+        "method": args.method_name,
+        "utility_dataset": str(args.utility_dataset),
+        "block_count": len(blocks),
+        "token_count": total_tokens,
+        "retain_loss": mean_loss,
+        "retain_ppl": ppl,
+        "attention_heads_edit_applied_to_full_wikitext_block": False,
+        "attention_heads_edit_applied_to_aligned_span": bool(apply_heads),
+        "ppl_attention_heads_edit_mode": args.ppl_attention_heads_edit_mode,
+        "ppl_score_region": "continuation",
+        "ppl_protocol": args.ppl_protocol,
+        "ppl_prefix_tokens": args.ppl_prefix_tokens,
+        "ppl_continuation_tokens": args.ppl_continuation_tokens,
+        "steering_span_mode": args.steering_span_mode,
+        "steering_tail_tokens": args.steering_tail_tokens,
+        "selected_span_token_count_mean": (
+            sum(selected_span_token_counts) / len(selected_span_token_counts)
+            if selected_span_token_counts
+            else None
+        ),
+        "selected_span_block_count": len(selected_span_token_counts),
+        "scored_positions_see_span_rate": (
+            sum(scored_see_span) / len(scored_see_span) if scored_see_span else None
+        ),
+        "span_alignment": "explicit_token_range",
+        "fingerprint": ppl_fingerprint(args),
+    }
+
+
+@torch.no_grad()
+def evaluate_ppl(model, attention_heads_edit_model, tokenizer, attention_heads_edit_steerer: AttentionHeadsEdit | None, args):
+    device = model_device(model)
+    if args.ppl_score_region == "continuation":
+        return evaluate_ppl_continuation(model, attention_heads_edit_model, tokenizer, attention_heads_edit_steerer, args, device)
+    return evaluate_ppl_full_block(model, attention_heads_edit_model, tokenizer, attention_heads_edit_steerer, args, device)
 
 
 def main() -> None:
@@ -565,6 +812,10 @@ def main() -> None:
             "steering_span_mode": args.steering_span_mode,
             "steering_tail_tokens": args.steering_tail_tokens,
             "ppl_attention_heads_edit_mode": args.ppl_attention_heads_edit_mode,
+            "ppl_score_region": args.ppl_score_region,
+            "ppl_protocol": args.ppl_protocol,
+            "ppl_prefix_tokens": args.ppl_prefix_tokens,
+            "ppl_continuation_tokens": args.ppl_continuation_tokens,
             "max_context_tokens": args.max_context_tokens,
             "load_in_4bit": args.load_in_4bit,
             "attn_implementation": args.attn_implementation,
@@ -616,7 +867,7 @@ def main() -> None:
     if attention_heads_edit_steerer is not None:
         payload["meta"].update(attention_heads_edit_steerer.runtime_stats())
         expects_attention_heads_edit_edits = args.run_mrr or args.run_attack or (
-            args.run_ppl and args.ppl_attention_heads_edit_mode == "full_block"
+            args.run_ppl and args.ppl_attention_heads_edit_mode in {"full_block", "aligned_span"}
         )
         if expects_attention_heads_edit_edits and (
             payload["meta"]["attention_heads_edit_hook_call_count"] <= 0

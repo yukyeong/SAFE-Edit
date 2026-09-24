@@ -465,6 +465,7 @@ class AttentionHeadsEdit(abc.ABC):
         model_input: ModelInput,
         offsets_mapping: Sequence[TokenizerOffsetMapping],
         occurrence: int = 0,
+        token_ranges: Optional[Any] = None,
     ):
         """
         The function of context manager to register the pre-forward hook on `model`.
@@ -476,16 +477,21 @@ class AttentionHeadsEdit(abc.ABC):
             model_input (`transformers.BatchEncoding`): The batched model inputs.
             offsets_mapping (`TokenizerOffsetMapping`): The offset mapping outputed by
                 the tokenizer when encoding the `strings`.
+            token_ranges: Optional explicit token ranges. If set, substring search is skipped.
+                Each item is a (batch, 2) tensor of [start, end) token indices.
         """
-        if isinstance(substrings[0], str):
-            substrings = [substrings]
+        if token_ranges is None:
+            if isinstance(substrings[0], str):
+                substrings = [substrings]
 
-        token_ranges = []
-        for sections in substrings:
-            token_range = self.token_ranges_from_batch(
-                strings, sections, offsets_mapping, occurrence=occurrence,
-            )
-            token_ranges.append(token_range)
+            token_ranges = []
+            for sections in substrings:
+                token_range = self.token_ranges_from_batch(
+                    strings, sections, offsets_mapping, occurrence=occurrence,
+                )
+                token_ranges.append(token_range)
+        elif isinstance(token_ranges, torch.Tensor):
+            token_ranges = [token_ranges]
 
         registered_hooks = []
         for layer_idx in self.all_layers_idx:

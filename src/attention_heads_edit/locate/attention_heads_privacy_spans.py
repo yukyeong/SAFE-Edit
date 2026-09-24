@@ -58,6 +58,28 @@ def select_privacy_steering_span(
     return span
 
 
+def select_privacy_steering_token_range(
+    prefix_token_count: int,
+    *,
+    mode: str = "tail_tokens",
+    tail_tokens: int = 8,
+) -> tuple[int, int]:
+    """Return [start, end) token indices relative to a prefix of prefix_token_count tokens."""
+    if mode not in STEERING_SPAN_MODES:
+        raise ValueError(f"Unsupported steering span mode: {mode}")
+    if prefix_token_count <= 0:
+        raise ValueError("prefix_token_count must be positive")
+    if mode == "full_prompt":
+        return 0, prefix_token_count
+    if tail_tokens <= 0:
+        raise ValueError("tail_tokens must be positive")
+    selected_count = tail_tokens
+    if mode == "adaptive_tail":
+        selected_count = adaptive_tail_count(prefix_token_count, tail_tokens)
+    selected_count = min(selected_count, prefix_token_count)
+    return prefix_token_count - selected_count, prefix_token_count
+
+
 def attention_ranges(
     *,
     prompt_len: int,

@@ -299,7 +299,7 @@ outputs/attention_heads_edit/heads/<run>_*.json
 logs/ffn_edit/<run>.log
 ```
 
-Lower privacy metrics usually mean less leakage; lower PPL usually means better utility. Joint runners default to `ppl_attention_heads_edit_mode=none`: Attention Heads Edit affects privacy generation only, not WikiText PPL, so FFN Edit-only and joint PPL matching is expected. To measure Attention Heads Edit on the utility block, use `--ppl_attention_heads_edit_mode full_block` and report that setting separately.
+Lower privacy metrics usually mean less leakage; lower PPL usually means better utility. WikiText PPL defaults to prefix-continuation scoring (`--ppl_score_region continuation`, `--ppl_protocol prefix_continuation_v1`): 384 prefix tokens plus 128 continuation tokens, with NLL only on the continuation. `--ppl_attention_heads_edit_mode none` leaves Attention Heads Edit off for that PPL. `aligned_span` applies the same prefix-tail span used for leakage. `full_block` scores the whole block and is rejected when the score region is continuation.
 
 ## 10. Architecture Notes
 

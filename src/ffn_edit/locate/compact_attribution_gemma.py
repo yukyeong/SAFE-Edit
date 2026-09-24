@@ -73,14 +73,26 @@ def normalize_for_assert(text: str) -> str:
     return " ".join(str(text).strip().split())
 
 
-def locate_secret_tokens(tokenizer, full_text: str, secret: str) -> tuple[list[int], int | None, int | None]:
+def locate_secret_tokens(
+    tokenizer,
+    full_text: str,
+    secret: str,
+    gold_char_start: int | None = None,
+) -> tuple[list[int], int | None, int | None]:
     encoded = tokenizer(full_text, add_special_tokens=False, return_offsets_mapping=True)
     full_ids = encoded["input_ids"]
     offsets = encoded.get("offset_mapping")
     if not full_ids:
         return [], None, None
 
-    secret_start_char = full_text.find(secret) if secret else -1
+    if gold_char_start is not None:
+        if gold_char_start < 0 or gold_char_start > len(full_text):
+            return full_ids, None, None
+        if secret and full_text[gold_char_start : gold_char_start + len(secret)] != secret:
+            return full_ids, None, None
+        secret_start_char = gold_char_start
+    else:
+        secret_start_char = full_text.find(secret) if secret else -1
     if secret and secret_start_char >= 0 and offsets:
         secret_end_char = secret_start_char + len(secret)
         token_positions = [
@@ -98,7 +110,7 @@ def locate_secret_tokens(tokenizer, full_text: str, secret: str) -> tuple[list[i
                 return full_ids, start, end
             return full_ids, start, end
 
-    if secret:
+    if gold_char_start is None and secret:
         secret_ids = tokenizer(secret, add_special_tokens=False)["input_ids"]
         start = find_token_subsequence(full_ids, secret_ids)
         if start is not None:
@@ -106,29 +118,51 @@ def locate_secret_tokens(tokenizer, full_text: str, secret: str) -> tuple[list[i
     return full_ids, None, None
 
 
+def parse_gold_char_start(example: list[Any]) -> int | None:
+    if len(example) < 3 or example[2] in (None, ""):
+        return None
+    return int(example[2])
+
+
 def example2feature(example: list[Any], max_seq_length: int, tokenizer) -> tuple[dict[str, list[int]], dict[str, Any]]:
     full_text = str(example[0])
     secret = str(example[1]) if len(example) > 1 else ""
-    full_ids, secret_start, secret_end = locate_secret_tokens(tokenizer, full_text, secret)
+    gold_char_start = parse_gold_char_start(example)
+    locate_mode = "gold_char_start" if gold_char_start is not None else "first_match"
+    full_ids, secret_start, secret_end = locate_secret_tokens(
+        tokenizer, full_text, secret, gold_char_start=gold_char_start
+    )
 
     gold_obj = None
+    skip_reason = None
     secret_located = secret_start is not None and secret_start > 0
     if secret_located:
         gold_obj = int(full_ids[secret_start])
         input_ids = full_ids[:secret_start]
     else:
         input_ids = full_ids
+        if secret_start == 0:
+            skip_reason = "empty_prefix"
+        elif gold_char_start is not None:
+            skip_reason = "gold_char_start_not_tokenized"
+        else:
+            skip_reason = "secret_not_located"
 
     if not input_ids:
         input_ids = [tokenizer.eos_token_id]
+        if secret_located:
+            secret_located = False
+            skip_reason = "empty_prefix"
     if len(input_ids) > max_seq_length:
         input_ids = input_ids[-max_seq_length:]
 
     real_len = len(input_ids)
     target_pos = max(0, real_len - 1)
+    used_fallback_target = False
     if gold_obj is None:
         next_pos = min(target_pos + 1, len(full_ids) - 1)
         gold_obj = int(full_ids[next_pos]) if full_ids else int(tokenizer.eos_token_id)
+        used_fallback_target = True
 
     padding_length = max_seq_length - real_len
     if padding_length > 0:
@@ -142,47 +176,72 @@ def example2feature(example: list[Any], max_seq_length: int, tokenizer) -> tuple
             "target_pos": target_pos,
             "secret_located": bool(secret_located),
             "secret_token_span": [secret_start, secret_end] if secret_start is not None else None,
+            "gold_char_start": gold_char_start,
+            "locate_mode": locate_mode,
+            "skip_reason": skip_reason,
+            "used_fallback_target": used_fallback_target,
         },
     )
 
 
-def normalize_privacy_bag(raw_bag: Any) -> tuple[list[list[str]], bool]:
-    """Accept both [[full, secret], ...] and legacy [full, secret] bag shapes."""
+def _example_row(full_text: Any, secret: Any, gold_char_start: Any = None) -> list[Any]:
+    row: list[Any] = [str(full_text), str(secret)]
+    if gold_char_start not in (None, ""):
+        row.append(int(gold_char_start))
+    return row
+
+
+def normalize_privacy_bag(raw_bag: Any) -> tuple[list[list[Any]], bool]:
+    """Accept [[full, secret], ...], [[full, secret, gold_char_start], ...], or legacy [full, secret]."""
 
     if isinstance(raw_bag, dict):
         secret = raw_bag.get("output", raw_bag.get("target", ""))
         full_text = raw_bag.get("full_text")
+        gold = raw_bag.get("gold_char_start", raw_bag.get("target_char_start"))
         if full_text is None:
-            full_text = str(raw_bag.get("input", "")) + str(secret)
-        return [[str(full_text), str(secret)]], False
+            prefix = str(raw_bag.get("input", ""))
+            full_text = prefix + str(secret)
+            if gold is None:
+                gold = len(prefix)
+        return [_example_row(full_text, secret, gold)], False
 
     if not isinstance(raw_bag, (list, tuple)) or not raw_bag:
         return [], False
 
     if len(raw_bag) >= 2 and isinstance(raw_bag[0], str) and isinstance(raw_bag[1], str):
-        return [[str(raw_bag[0]), str(raw_bag[1])]], True
+        gold = raw_bag[2] if len(raw_bag) >= 3 else None
+        return [_example_row(raw_bag[0], raw_bag[1], gold)], True
 
-    normalized: list[list[str]] = []
+    normalized: list[list[Any]] = []
     for item in raw_bag:
         if isinstance(item, dict):
             secret = item.get("output", item.get("target", ""))
             full_text = item.get("full_text")
+            gold = item.get("gold_char_start", item.get("target_char_start"))
             if full_text is None:
-                full_text = str(item.get("input", "")) + str(secret)
-            normalized.append([str(full_text), str(secret)])
+                prefix = str(item.get("input", ""))
+                full_text = prefix + str(secret)
+                if gold is None:
+                    gold = len(prefix)
+            normalized.append(_example_row(full_text, secret, gold))
         elif isinstance(item, (list, tuple)) and len(item) >= 2:
-            normalized.append([str(item[0]), str(item[1])])
+            gold = item[2] if len(item) >= 3 else None
+            normalized.append(_example_row(item[0], item[1], gold))
     return normalized, False
 
 
-def validate_privacy_bags(privacy_bags: list[Any]) -> None:
+def validate_privacy_bags(privacy_bags: list[Any], *, require_gold_char_start: bool = False) -> None:
     checked = 0
     located = 0
+    gold_present = 0
     legacy_pairs = 0
     for raw_bag in privacy_bags[: min(50, len(privacy_bags))]:
         examples, was_legacy_pair = normalize_privacy_bag(raw_bag)
         legacy_pairs += int(was_legacy_pair)
-        for full_text, secret in examples:
+        for example in examples:
+            full_text, secret = example[0], example[1]
+            if parse_gold_char_start(example) is not None:
+                gold_present += 1
             checked += 1
             if secret and secret in full_text:
                 located += 1
@@ -190,6 +249,10 @@ def validate_privacy_bags(privacy_bags: list[Any]) -> None:
         raise SystemExit(
             "privacy data format check failed: no sampled secret appears in its full text. "
             "Expected [[full_text, secret], ...] per bag or legacy [full_text, secret]."
+        )
+    if require_gold_char_start and gold_present != checked:
+        raise SystemExit(
+            f"require_gold_char_start failed: gold present in {gold_present}/{checked} sampled examples"
         )
     if legacy_pairs:
         print(
@@ -386,6 +449,8 @@ def main() -> None:
     parser.add_argument("--save_every", type=int, default=20)
     parser.add_argument("--progress_every", type=int, default=20)
     parser.add_argument("--limit_bags", type=int, default=None)
+    parser.add_argument("--skip_unlocated", action="store_true", help="Skip examples whose secret span is not located.")
+    parser.add_argument("--require_gold_char_start", action="store_true", help="Require gold_char_start on every privacy example.")
     parser.add_argument("--torch_dtype", default="bfloat16", choices=["auto", "float16", "bfloat16", "float32"])
     parser.add_argument("--device_map", default="auto")
     parser.add_argument("--attn_implementation", default="sdpa")
@@ -481,7 +546,7 @@ def main() -> None:
         privacy_bags = json.load(handle)
     if args.limit_bags is not None:
         privacy_bags = privacy_bags[: args.limit_bags]
-    validate_privacy_bags(privacy_bags)
+    validate_privacy_bags(privacy_bags, require_gold_char_start=bool(args.require_gold_char_start))
 
     resume_count, counts, score_sums, stats = load_state(output_dir, args.output_prefix)
     if args.limit_bags is not None and resume_count > 0:
@@ -521,9 +586,13 @@ def main() -> None:
         sum_tensor = torch.zeros((len(layer_indices), intermediate_size), dtype=torch.float32)
         for ex_idx, example in enumerate(examples):
             features, token_info = example2feature(example, args.max_seq_length, tokenizer)
-            stats["secret_located" if token_info["secret_located"] else "secret_unlocated"] = int(
-                stats.get("secret_located" if token_info["secret_located"] else "secret_unlocated", 0)
+            located = bool(token_info["secret_located"])
+            stats["secret_located" if located else "secret_unlocated"] = int(
+                stats.get("secret_located" if located else "secret_unlocated", 0)
             ) + 1
+            if args.skip_unlocated and not located:
+                stats["skipped_unlocated"] = int(stats.get("skipped_unlocated", 0)) + 1
+                continue
             input_ids = torch.tensor(features["input_ids"], dtype=torch.long, device=device).unsqueeze(0)
             attention_mask = torch.tensor(features["attention_mask"], dtype=torch.long, device=device).unsqueeze(0)
             real_len = int(attention_mask[0].sum().item())
